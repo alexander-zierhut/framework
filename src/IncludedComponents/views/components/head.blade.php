@@ -25,6 +25,10 @@
     Z.Request.absRoot = "<?= $opt["absRoot"]; ?>";
 </script>
 
+@if(config("navigation", default: "") === "boost")
+    <meta name="z-navigate" content="boost">
+@endif
+
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 

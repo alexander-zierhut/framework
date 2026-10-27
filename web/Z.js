@@ -901,7 +901,10 @@ class ZForm {
       processData: false
     };
 
-    if(customUrl != null) ajax_options.url = customUrl;
+    // Inside an island the page URL belongs to the host page, so post to the island's route
+    var island = this.dom.closest("[data-z-island]");
+    var url = customUrl ?? (island ? island.dataset.zSrc : null);
+    if(url != null) ajax_options.url = url;
 
     $.ajax(ajax_options).done((data) => {
       var json;
@@ -919,6 +922,14 @@ class ZForm {
           this.saveHook(json);
         }
 
+        if (island && Z.Islands) {
+          Z.Islands.toast(Z.Lang.saved);
+          Z.Islands.touched(url, island);
+          var modal = island.closest(".z-modal");
+          if (modal) return jQuery(modal).modal("hide");
+          Z.Islands.refresh(island);
+          return;
+        }
         if (this.doReload) window.location.reload();
         this.hint("alert-success", Z.Lang.saved);
       } else if (json.result == "formErrors") {
@@ -1877,3 +1888,692 @@ class ZFormField {
     return this._isHidden;
   }
 }
+
+
+/**
+ * Experimental: scopes.
+ *
+ * Lets server-rendered HTML be inserted again and again (islands, page navigation) while its
+ * inline scripts stay ordinary view scripts:
+ * - Re-run scripts get a block of their own, so top-level let/const/class do not throw
+ *   "already declared". Their top-level names are copied to window afterwards, so inline
+ *   handlers (onclick="form.send()") and later scripts still find them.
+ * - While a scope's inline scripts run, listeners added to window/document/body/html (native or
+ *   jQuery) and timers are recorded and removed again by teardown(), so nothing piles up.
+ * - DOMContentLoaded/load listeners registered by re-run scripts are called once, as the real
+ *   events are long gone.
+ * Library scripts (<script src>) are never recorded: they run once per page and stay.
+ */
+Z.Scope = (() => {
+  const native = {
+    add: EventTarget.prototype.addEventListener,
+    remove: EventTarget.prototype.removeEventListener,
+    setTimeout: window.setTimeout.bind(window),
+    clearTimeout: window.clearTimeout.bind(window),
+    setInterval: window.setInterval.bind(window),
+    clearInterval: window.clearInterval.bind(window),
+  };
+  const JS_TYPES = ["", "text/javascript", "application/javascript", "module"];
+  let active = null;
+  let counter = 0;
+
+  const isGlobalTarget = (t) => t === window || t === document || t === document.documentElement || t === document.body;
+
+  // Record only page code: inline scripts, or async work started by them
+  const recording = () => {
+    if (!active) return null;
+    const current = document.currentScript;
+    if (current && current.src) return null;
+    return active;
+  };
+
+  const create = (name = "scope") => ({ id: ++counter, name, root: null, listeners: [], timers: [], cleanups: [], ready: [] });
+
+  // The same view can be on the page twice (sidebar island + modal): ids resolve inside the
+  // container whose scripts are running first, so Z.Forms.create({dom: "x"}) and $("#x") hit
+  // their own copy
+  const getElementById = Document.prototype.getElementById;
+  Document.prototype.getElementById = function (id) {
+    const root = active && active.root;
+    if (this !== document || !root || !root.isConnected) return getElementById.call(this, id);
+    return root.querySelector("#" + CSS.escape(id)) || getElementById.call(this, id);
+  };
+
+  // Run fn with scope active, also when it is called later from a recorded timer
+  const within = (scope, fn, self, args) => {
+    const previous = active;
+    active = scope;
+    try { return fn.apply(self, args); } finally { active = previous; }
+  };
+
+  EventTarget.prototype.addEventListener = function (type, listener, options) {
+    const scope = recording();
+    if (scope && isGlobalTarget(this) && listener) {
+      scope.listeners.push([this, type, listener, options]);
+      if (type === "DOMContentLoaded" || (type === "load" && this === window)) scope.ready.push([this, type, listener]);
+    }
+    return native.add.call(this, type, listener, options);
+  };
+
+  const patchTimer = (name, clear) => {
+    window[name] = function (fn, delay, ...args) {
+      const scope = recording();
+      if (!scope || typeof fn !== "function") return native[name](fn, delay, ...args);
+      const id = native[name](function () { return within(scope, fn, this, arguments); }, delay, ...args);
+      scope.timers.push([clear, id]);
+      return id;
+    };
+  };
+  patchTimer("setTimeout", "clearTimeout");
+  patchTimer("setInterval", "clearInterval");
+
+  // jQuery keeps one native listener per element, so namespace its handlers per scope instead
+  const patchJQuery = () => {
+    if (!window.jQuery || jQuery.event.__zScoped) return;
+    const add = jQuery.event.add;
+    jQuery.event.add = function (elem, types, ...rest) {
+      const scope = recording();
+      if (!scope || !isGlobalTarget(elem) || typeof types !== "string") return add.call(this, elem, types, ...rest);
+      const namespaced = types.split(/\s+/).filter(Boolean).map((t) => t + ".zscope" + scope.id).join(" ");
+      return add.call(this, elem, namespaced, ...rest);
+    };
+    jQuery.event.__zScoped = true;
+  };
+  patchJQuery();
+
+  const teardown = (scope) => {
+    if (!scope) return;
+    scope.listeners.forEach(([t, type, l, o]) => native.remove.call(t, type, l, o));
+    scope.timers.forEach(([clear, id]) => native[clear](id));
+    if (window.jQuery) jQuery([window, document, document.documentElement, document.body]).off(".zscope" + scope.id);
+    scope.cleanups.forEach((fn) => { try { fn(); } catch (e) { console.error(e); } });
+    scope.listeners = []; scope.timers = []; scope.cleanups = []; scope.ready = [];
+  };
+
+  const exportsOf = (code) => {
+    const names = new Set();
+    for (const m of code.matchAll(/^[ \t]*(?:let|const|class)[ \t]+([A-Za-z_$][\w$]*)/gm)) names.add(m[1]);
+    return Array.from(names).map((n) => `try{window[${JSON.stringify(n)}]=${n}}catch(e){}`).join("");
+  };
+
+  const loadedSrc = () => new Set(Array.from(document.scripts).filter((s) => s.src).map((s) => s.src));
+
+  /**
+   * Executes the (inert) scripts inside container in document order within scope.
+   * Same-origin <script src> run once per page, others are skipped.
+   */
+  const run = (container, scope) => {
+    patchJQuery();
+    const loaded = loadedSrc();
+    const scripts = Array.isArray(container) ? container : Array.from(container.querySelectorAll("script"));
+    if (!Array.isArray(container)) scope.root = container;
+    let chain = Promise.resolve();
+    for (const old of scripts) {
+      const type = (old.getAttribute("type") || "").toLowerCase();
+      if (!JS_TYPES.includes(type)) continue;
+      const script = document.createElement("script");
+      for (const attr of old.attributes) script.setAttribute(attr.name, attr.value);
+      if (old.src) {
+        const url = new URL(old.getAttribute("src"), location.href);
+        if (url.origin !== location.origin || loaded.has(url.href)) {
+          old.remove();
+          continue;
+        }
+        loaded.add(url.href);
+        script.async = false;
+        chain = chain.then(() => new Promise((resolve) => {
+          script.onload = script.onerror = resolve;
+          old.replaceWith(script);
+        }));
+        continue;
+      }
+      const code = old.textContent;
+      script.textContent = type === "module" ? code : "{\n" + code + "\n;" + exportsOf(code) + "}";
+      chain = chain.then(() => within(scope, () => old.replaceWith(script)));
+    }
+    return chain.then(() => {
+      // The page already loaded: call the load handlers the scripts just registered
+      scope.ready.splice(0).forEach(([target, type, listener]) => {
+        const event = new Event(type);
+        within(scope, () => (typeof listener === "function" ? listener.call(target, event) : listener.handleEvent(event)));
+      });
+    });
+  };
+
+  // Head scripts and styles after Z.js belong to the page, navigation replaces them
+  const self = document.currentScript;
+  if (self) new MutationObserver((mutations, observer) => {
+    mutations.forEach((m) => m.addedNodes.forEach((n) => {
+      if (n.parentNode !== document.head) return;
+      if ((n.tagName === "SCRIPT" && !n.src) || n.tagName === "STYLE") n.dataset.zPage = "1";
+    }));
+    if (document.body) observer.disconnect();
+  }).observe(document.head, { childList: true });
+
+  // Everything the initial page registers after Z.js belongs to the first page scope
+  const page = create("page");
+  active = page;
+  native.add.call(window, "load", () => { if (active === page) active = null; });
+
+  return {
+    create, run, teardown, within, native,
+    /** The scope of the current page; replaced on every navigation */
+    page,
+    /** Registers a cleanup for the scope the calling script runs in */
+    onCleanup(fn) {
+      const scope = active || Z.Scope.page;
+      scope.cleanups.push(fn);
+    },
+  };
+})();
+
+/**
+ * Experimental: islands.
+ *
+ * Runtime for <x-zubzet::island> and <x-zubzet::action>. An island fetches a route of this
+ * application with the Z-Island header; the server answers with the bare view (no layout), an
+ * ETag and 304 when nothing changed. Only marked, successful HTML responses are ever inserted.
+ * Any response (also ZForm and Z.Request ones) may carry Z-Island-Trigger to refresh islands
+ * listening via refresh-on, and Z-Island-Flash to show a toast.
+ * Islands with the nav attribute load their own links and GET forms in place (pagination).
+ */
+Z.Islands = (() => {
+  const { setTimeout, clearTimeout } = Z.Scope.native;
+  const MIN_INTERVAL = 2000;
+  const MAX_BACKOFF = 300000;
+  const states = new WeakMap();
+
+  const sameApp = (url) => {
+    if (!url) return null;
+    const u = new URL(url, location.href);
+    if (u.origin !== location.origin) return null;
+    if (!u.pathname.startsWith(Z.Request.rootPath || "/")) return null;
+    return u;
+  };
+
+  const state = (el) => {
+    let st = states.get(el);
+    if (st) return st;
+    st = { timer: null, abort: null, etag: null, html: null, errors: 0, dirty: false, visible: true, observer: null, stopped: false, scope: null };
+    states.set(el, st);
+    Z.Scope.native.add.call(el, "input", () => { st.dirty = true; });
+    return st;
+  };
+
+  const setState = (el, name) => {
+    el.dataset.zState = name;
+    el.setAttribute("aria-busy", name === "loading" ? "true" : "false");
+  };
+
+  const emit = (el, name, detail = {}) => el.dispatchEvent(new CustomEvent("z:island:" + name, { bubbles: true, cancelable: true, detail: { el, ...detail } }));
+
+  const interval = (el) => {
+    const every = parseInt(el.dataset.zEvery || "0", 10);
+    if (!every) return 0;
+    return Math.max(MIN_INTERVAL, every);
+  };
+
+  const schedule = (el, delay) => {
+    const st = state(el);
+    clearTimeout(st.timer);
+    if (st.stopped || !delay) return;
+    st.timer = setTimeout(() => load(el), delay * (0.9 + Math.random() * 0.2));
+  };
+
+  // Do not pull the rug out from under the user: no swap while they type in the island
+  const busyEditing = (el) => {
+    if (state(el).dirty) return true;
+    const active = document.activeElement;
+    if (!active || !el.contains(active)) return false;
+    return active.matches("input, textarea, select, [contenteditable]");
+  };
+
+  const swap = (el, html) => {
+    const st = state(el);
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    if (el.dataset.zScripts === "none") template.content.querySelectorAll("script").forEach((s) => s.remove());
+    Z.Scope.teardown(st.scope);
+    st.scope = Z.Scope.create("island " + el.dataset.zSrc);
+    el.replaceChildren(template.content);
+    st.html = html;
+    st.dirty = false;
+    return Z.Scope.run(el, st.scope).then(() => emit(el, "loaded"));
+  };
+
+  const handleHeaders = (getHeader) => {
+    const flash = getHeader("Z-Island-Flash");
+    if (flash) toast(flash);
+    const trigger = getHeader("Z-Island-Trigger");
+    if (trigger) Z.Islands.trigger(trigger.split(/[\s,]+/));
+  };
+
+  const fail = (el, status) => {
+    const st = state(el);
+    setState(el, "error");
+    emit(el, "error", { status });
+    if (status === 403 || status === 404) return; // configuration errors, do not hammer
+    st.errors++;
+    const base = interval(el) || 5000;
+    schedule(el, Math.min(base * Math.pow(2, st.errors), MAX_BACKOFF));
+  };
+
+  const unauthorized = (el) => {
+    setState(el, "auth");
+    if (!emit(el, "unauthorized")) return;
+    if (el.dataset.zAuth !== "1") return;
+    // The page was rendered for a logged in user, so the session expired: reload once
+    const key = "z-island-reload:" + location.pathname;
+    if (sessionStorage.getItem(key)) return;
+    sessionStorage.setItem(key, "1");
+    location.reload();
+  };
+
+  // force: the user asked for this load (navigation, refresh, trigger), skip the typing guard
+  const load = (el, force = false) => {
+    const st = state(el);
+    if (st.stopped || !el.isConnected) return stop(el);
+    const url = sameApp(el.dataset.zSrc);
+    if (!url) return setState(el, "error");
+    if (document.hidden || !st.visible) return; // resumed by visibility handlers
+    if (!force && st.html !== null && busyEditing(el)) return schedule(el, interval(el) || MIN_INTERVAL);
+
+    if (st.abort) st.abort.abort();
+    st.abort = new AbortController();
+    const slow = setTimeout(() => setState(el, "loading"), 300);
+    const headers = { "Z-Island": "1", "X-Requested-With": "XMLHttpRequest" };
+    if (el.dataset.zFragment) headers["Z-Island-Fragment"] = el.dataset.zFragment;
+    if (st.etag) headers["If-None-Match"] = st.etag;
+    if (!emit(el, "before", { url: url.href })) return clearTimeout(slow);
+
+    return fetch(url.href, { method: "GET", mode: "same-origin", credentials: "same-origin", cache: "no-store", headers, signal: st.abort.signal })
+      .then((response) => {
+        clearTimeout(slow);
+        emit(el, "response", { response });
+        handleHeaders((name) => response.headers.get(name));
+        return handle(el, response);
+      })
+      .catch((error) => {
+        clearTimeout(slow);
+        if (error.name === "AbortError") return;
+        fail(el, 0);
+      });
+  };
+
+  const handle = (el, response) => {
+    const st = state(el);
+    const marked = response.headers.get("Z-Island") === "1";
+    if (response.status === 304) {
+      st.errors = 0;
+      setState(el, "idle");
+      return schedule(el, interval(el));
+    }
+    if (marked && response.status === 401) return unauthorized(el);
+    const redirect = response.headers.get("Z-Island-Redirect");
+    if (marked && response.status === 204 && redirect) {
+      const target = sameApp(redirect);
+      if (target) location.assign(target.href);
+      return;
+    }
+    const html = (response.headers.get("Content-Type") || "").startsWith("text/html");
+    if (!response.ok || !marked || !html) return fail(el, response.status);
+
+    st.errors = 0;
+    st.etag = response.headers.get("ETag");
+    sessionStorage.removeItem("z-island-reload:" + location.pathname);
+    return response.text().then((body) => {
+      setState(el, "idle");
+      schedule(el, interval(el));
+      if (body === st.html) return;
+      return swap(el, body);
+    });
+  };
+
+  const start = (el) => {
+    const st = state(el);
+    if (st.started) return;
+    st.started = true;
+    st.stopped = false;
+    if (el.dataset.zLazy !== "1") return load(el);
+    st.visible = false;
+    st.observer = new IntersectionObserver((entries) => {
+      const wasVisible = st.visible;
+      st.visible = entries.some((e) => e.isIntersecting);
+      if (st.visible && !wasVisible) load(el);
+    });
+    st.observer.observe(el);
+  };
+
+  const stop = (el) => {
+    const st = state(el);
+    st.stopped = true;
+    st.started = false;
+    clearTimeout(st.timer);
+    if (st.abort) st.abort.abort();
+    if (st.observer) st.observer.disconnect();
+    Z.Scope.teardown(st.scope);
+  };
+
+  const islandsIn = (root) => {
+    if (!(root instanceof Element) && root !== document) return [];
+    const found = Array.from(root.querySelectorAll("[data-z-island]"));
+    if (root instanceof Element && root.matches("[data-z-island]")) found.unshift(root);
+    return found;
+  };
+
+  // Points an island at another route of the app and loads it (pagination, sorting, filters)
+  const navigate = (el, href) => {
+    const url = sameApp(href);
+    if (!url) return false;
+    const st = state(el);
+    el.dataset.zSrc = url.pathname + url.search;
+    st.etag = null;
+    st.dirty = false;
+    load(el, true);
+    return true;
+  };
+
+  // Toasts: plain text only, never HTML
+  const toast = (raw) => {
+    const at = raw.indexOf(":");
+    const level = ["success", "info", "warning", "danger"].includes(raw.slice(0, at)) ? raw.slice(0, at) : "info";
+    let box = document.getElementById("z-toasts");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "z-toasts";
+      box.style.cssText = "position:fixed;right:1rem;bottom:1rem;z-index:2000;display:flex;flex-direction:column;gap:.5rem;max-width:360px";
+      document.body.appendChild(box);
+    }
+    const item = document.createElement("div");
+    item.className = "alert alert-" + level + " shadow-sm mb-0";
+    item.setAttribute("role", "status");
+    item.textContent = decodeURIComponent(raw.slice(at + 1));
+    box.appendChild(item);
+    setTimeout(() => item.remove(), 4000);
+  };
+
+  const navIsland = (node) => {
+    const el = node.closest("[data-z-island]");
+    if (!el || el.dataset.zNav !== "1") return null;
+    if (node.closest("[data-z-native]")) return null;
+    return el;
+  };
+
+  const plainClick = (event) => event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+
+  // Links inside nav islands load in place
+  Z.Scope.native.add.call(document, "click", (event) => {
+    if (event.defaultPrevented || !plainClick(event)) return;
+    const link = event.target.closest("a[href]");
+    if (!link || link.target || link.hasAttribute("download")) return;
+    const el = navIsland(link);
+    if (!el) return;
+    if (!navigate(el, link.href)) return;
+    event.preventDefault();
+  });
+
+  // GET forms inside nav islands (filters, search) load in place
+  Z.Scope.native.add.call(document, "submit", (event) => {
+    const form = event.target;
+    if (event.defaultPrevented || (form.method || "get").toLowerCase() !== "get") return;
+    const el = navIsland(form);
+    if (!el) return;
+    const url = new URL(form.getAttribute("action") || el.dataset.zSrc, location.href);
+    url.search = new URLSearchParams(new FormData(form)).toString();
+    if (!navigate(el, url.href)) return;
+    event.preventDefault();
+  });
+
+  // <x-zubzet::modal>: open a route in a Bootstrap modal; the body is an island
+  const openModal = (href, title, size) => {
+    const url = sameApp(href);
+    if (!url || !window.jQuery || !jQuery.fn.modal) return false;
+    const modal = document.createElement("div");
+    modal.className = "modal fade z-modal";
+    modal.tabIndex = -1;
+    modal.setAttribute("role", "dialog");
+    modal.innerHTML = '<div class="modal-dialog modal-dialog-scrollable" role="document"><div class="modal-content">' +
+      '<div class="modal-header"><h5 class="modal-title"></h5><button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button></div>' +
+      '<div class="modal-body"><div class="z-island" data-z-island data-z-every="0" data-z-lazy="0" data-z-nav="1" data-z-scripts="run"><div class="text-muted">…</div></div></div></div></div>';
+    if (size) modal.firstChild.classList.add("modal-" + size);
+    modal.querySelector(".modal-title").textContent = title || "";
+    modal.querySelector("[data-z-island]").dataset.zSrc = url.pathname + url.search;
+    modal.querySelector("[data-z-island]").dataset.zAuth = document.querySelector('[data-z-auth="1"]') ? "1" : "0";
+    document.body.appendChild(modal);
+    jQuery(modal).on("hidden.bs.modal", () => modal.remove()).modal("show");
+    return true;
+  };
+
+  Z.Scope.native.add.call(document, "click", (event) => {
+    if (event.defaultPrevented || !plainClick(event)) return;
+    const link = event.target.closest("[data-z-modal]");
+    if (!link) return;
+    if (!openModal(link.dataset.zModal, link.dataset.zModalTitle, link.dataset.zModalSize)) return;
+    event.preventDefault();
+  });
+
+  // <x-zubzet::action>: POST without a form, then refresh the surrounding island
+  Z.Scope.native.add.call(document, "click", (event) => {
+    const button = event.target.closest("[data-z-action]");
+    if (!button) return;
+    const url = sameApp(button.dataset.zAction);
+    if (!url) return;
+    if (button.dataset.zConfirm && !confirm(button.dataset.zConfirm)) return;
+    const body = new FormData();
+    Object.entries(JSON.parse(button.dataset.zData || "{}")).forEach(([k, v]) => body.set(k, v));
+    const island = button.closest("[data-z-island]");
+    button.disabled = true;
+    fetch(url.href, { method: "POST", mode: "same-origin", credentials: "same-origin", body, headers: { "Z-Island": "1", "X-Requested-With": "XMLHttpRequest" } })
+      .then((response) => {
+        handleHeaders((name) => response.headers.get(name));
+        if (!response.ok) return toast("danger:" + encodeURIComponent(Z.Lang.saveError));
+        if (island && button.dataset.zThen !== "none") Z.Islands.refresh(island);
+        Z.Islands.touched(url.href, island);
+      })
+      .finally(() => { button.disabled = false; });
+  });
+
+  // Responses of the existing jQuery based helpers (ZForm, Z.Request) can trigger islands too
+  if (window.jQuery) jQuery(document).ajaxComplete((event, xhr) => handleHeaders((name) => xhr.getResponseHeader(name)));
+
+  Z.Scope.native.add.call(document, "visibilitychange", () => {
+    if (document.hidden) return;
+    islandsIn(document).filter((el) => interval(el)).forEach((el) => load(el));
+  });
+
+  const boot = () => {
+    const style = document.createElement("style");
+    style.textContent = ".z-island[data-z-state=loading]{opacity:.55;transition:opacity .2s}.z-island[data-z-state=error]{outline:1px dashed #dc3545}";
+    document.head.appendChild(style);
+    islandsIn(document).forEach(start);
+    new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        m.removedNodes.forEach((n) => islandsIn(n).forEach((el) => { if (!el.isConnected) stop(el); }));
+        m.addedNodes.forEach((n) => islandsIn(n).forEach(start));
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  };
+
+  if (document.readyState === "loading") Z.Scope.native.add.call(document, "DOMContentLoaded", boot);
+  if (document.readyState !== "loading") boot();
+
+  return {
+    scan: (root = document) => islandsIn(root).forEach(start),
+    refresh: (target) => {
+      const el = typeof target === "string" ? document.querySelector(target) : target;
+      if (!el) return;
+      state(el).dirty = false;
+      return load(el, true);
+    },
+    navigate,
+    stop,
+    trigger: (names) => {
+      const wanted = new Set([].concat(names).filter(Boolean));
+      islandsIn(document)
+        .filter((el) => (el.dataset.zRefreshOn || "").split(" ").some((n) => wanted.has(n)))
+        .forEach((el) => Z.Islands.refresh(el));
+    },
+    toast: (message, level = "success") => toast(level + ":" + encodeURIComponent(message)),
+    /** After a successful write to a route, every island showing that route refreshes */
+    touched: (href, except = null) => {
+      const url = sameApp(href);
+      if (!url) return;
+      islandsIn(document)
+        .filter((el) => el !== except && sameApp(el.dataset.zSrc) && sameApp(el.dataset.zSrc).pathname === url.pathname)
+        .forEach((el) => Z.Islands.refresh(el));
+    },
+    openModal,
+    sameApp,
+  };
+})();
+
+/**
+ * Experimental: page navigation.
+ *
+ * Opt-in with `navigation = boost` in the settings. Clicks on links within the application
+ * fetch the next page and swap its body in place instead of a full page load: no white flash,
+ * JS state and polling islands outside the swap survive, back/forward work. Inline view scripts
+ * re-run in a fresh Z.Scope, the previous page's document/window handlers and timers are removed.
+ * Whenever the next page needs different head assets, is not HTML, or anything fails, it falls
+ * back to a normal page load, so it is never worse than without it.
+ */
+Z.Navigate = (() => {
+  const { setTimeout, clearTimeout } = Z.Scope.native;
+  const DOWNLOAD = /\.(pdf|zip|csv|xlsx?|docx?|pptx?|png|jpe?g|gif|svg|webp|mp4|mp3|txt|json|xml)$/i;
+  let controller = null;
+
+  const enabled = () => !!document.querySelector('meta[name="z-navigate"][content="boost"]');
+
+  const assets = (doc, base) => Array.from(doc.head.querySelectorAll('link[rel~="stylesheet"][href], script[src]'))
+    .map((n) => new URL(n.getAttribute("href") || n.getAttribute("src"), base).href)
+    .sort().join("|");
+
+  const bar = (() => {
+    let el = null, timer = null;
+    return {
+      start() {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          el = el || document.createElement("div");
+          el.style.cssText = "position:fixed;top:0;left:0;height:3px;width:30%;background:#007bff;z-index:3000;transition:width 8s cubic-bezier(.1,.7,.2,1)";
+          document.documentElement.appendChild(el);
+          requestAnimationFrame(() => { el.style.width = "90%"; });
+        }, 150);
+      },
+      stop() {
+        clearTimeout(timer);
+        if (el) el.remove();
+      },
+    };
+  })();
+
+  const hard = (url, replace) => {
+    if (replace) return location.reload();
+    location.assign(url);
+  };
+
+  const render = (doc) => {
+    Z.Scope.teardown(Z.Scope.page);
+    const scope = Z.Scope.create("page");
+    Z.Scope.page = scope;
+
+    document.title = doc.title;
+    if (doc.documentElement.lang) document.documentElement.lang = doc.documentElement.lang;
+
+    // Page owned head nodes (inline scripts and styles): identical ones stay and do not re-run,
+    // as head scripts often initialize libraries once (e.g. jQuery.noConflict)
+    const key = (n) => n.tagName + ":" + n.textContent;
+    const current = new Map(Array.from(document.head.querySelectorAll("[data-z-page]")).map((n) => [key(n), n]));
+    const headScripts = [];
+    doc.head.querySelectorAll("script:not([src]), style").forEach((n) => {
+      if (current.delete(key(n))) return;
+      const node = document.adoptNode(n);
+      node.dataset.zPage = "1";
+      document.head.appendChild(node);
+      if (node.tagName === "SCRIPT") headScripts.push(node);
+    });
+    current.forEach((n) => n.remove());
+
+    Array.from(document.body.attributes).forEach((a) => document.body.removeAttribute(a.name));
+    Array.from(doc.body.attributes).forEach((a) => document.body.setAttribute(a.name, a.value));
+    document.body.replaceChildren(...Array.from(doc.body.childNodes).map((n) => document.adoptNode(n)));
+
+    return Z.Scope.run(headScripts.concat(Array.from(document.body.querySelectorAll("script"))), scope);
+  };
+
+  const scrollTo = (url, position) => {
+    if (position) return window.scrollTo(position[0], position[1]);
+    const target = url.hash && document.getElementById(decodeURIComponent(url.hash.slice(1)));
+    if (target) return target.scrollIntoView();
+    window.scrollTo(0, 0);
+  };
+
+  /**
+   * Shows url in place. push=false for back/forward, where the URL is already current.
+   */
+  const visit = (href, { push = true, scroll = null } = {}) => {
+    const url = Z.Islands.sameApp(href);
+    if (!url) return hard(href);
+    if (controller) controller.abort();
+    controller = new AbortController();
+    const signal = controller.signal;
+    bar.start();
+
+    return fetch(url.href, { credentials: "same-origin", headers: { "Z-Navigate": "1" }, signal })
+      .then((response) => {
+        const type = response.headers.get("Content-Type") || "";
+        const final = Z.Islands.sameApp(response.url);
+        if (!type.startsWith("text/html") || !final) {
+          controller.abort();
+          return hard(final ? final.href : url.href, !push);
+        }
+        return response.text().then((html) => {
+          const doc = new DOMParser().parseFromString(html, "text/html");
+          if (!doc.body || assets(doc, final.href) !== assets(document, location.href)) return hard(final.href, !push);
+          if (push) {
+            history.replaceState({ ...(history.state || {}), zNav: true, scroll: [scrollX, scrollY] }, "");
+            history.pushState({ zNav: true }, "", final.href + (url.hash || ""));
+          }
+          // jQuery captured the first page's URL as the default $.ajax url; ZForm and app code
+          // posting without a url must reach the page they are on now
+          if (window.jQuery) jQuery.ajaxSettings.url = location.href;
+          return render(doc).then(() => {
+            scrollTo(url, scroll);
+            document.dispatchEvent(new CustomEvent("z:navigate", { detail: { url: location.href } }));
+          });
+        });
+      })
+      .catch((error) => {
+        if (error.name === "AbortError") return;
+        console.error(error);
+        hard(url.href, !push);
+      })
+      .finally(() => { if (!signal.aborted) bar.stop(); });
+  };
+
+  Z.Scope.native.add.call(document, "click", (event) => {
+    if (!enabled() || event.defaultPrevented) return;
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target.closest("a[href]");
+    if (!link || link.target || link.hasAttribute("download") || link.closest("[data-z-native]")) return;
+    const url = Z.Islands.sameApp(link.href);
+    if (!url || DOWNLOAD.test(url.pathname)) return;
+    // Same page anchors stay native
+    if (url.pathname === location.pathname && url.search === location.search && url.hash) return;
+    event.preventDefault();
+    visit(url.href);
+  });
+
+  Z.Scope.native.add.call(window, "popstate", (event) => {
+    if (!enabled() || !event.state || !event.state.zNav) return;
+    visit(location.href, { push: false, scroll: event.state.scroll });
+  });
+
+  // Mark the first page so back to it is handled too
+  if (enabled() && !(history.state && history.state.zNav)) history.replaceState({ ...(history.state || {}), zNav: true }, "");
+  Z.Scope.native.add.call(document, "DOMContentLoaded", () => {
+    if (enabled() && !(history.state && history.state.zNav)) history.replaceState({ ...(history.state || {}), zNav: true }, "");
+  });
+
+  return { visit, enabled };
+})();

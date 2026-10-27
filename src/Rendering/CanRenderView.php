@@ -53,12 +53,22 @@
             // the provided opt parameters.
             $data = array_merge($opt, self::legacyOptExpansion($opt));
 
+            // An island asked for this page: drop the layout, answer with the bare view
+            $island = Island::claim();
+            if($island) $layoutName = self::viewName("layout/empty");
+            Island::header("Vary", "Z-Island, Z-Island-Fragment", true);
+
             try {
                 // Render using Katana
-                echo (string) Engine::render($viewName, $layoutName, $data);
+                $view = Engine::render($viewName, $layoutName, $data);
+                if($island) return Island::respond($view, request()->islandFragment());
+                echo (string) $view;
             } catch(BladeException $e) {
+                if($island) return Island::refuse(500);
                 // Render the 500 page when a view is not found
                 echo (string) Engine::render("500", "layout/min_layout", $data);
+            } finally {
+                Island::release($island);
             }
         }
 

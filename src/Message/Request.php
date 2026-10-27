@@ -28,6 +28,34 @@
 
         public array $urlParameters = [];
 
+        /**
+         * Reads a request header, e.g. header("Z-Island").
+         * @param string $name Header name, case insensitive
+         * @return string|null The header value or null when it is not sent
+         */
+        public function header(string $name): ?string {
+            $key = "HTTP_" . strtoupper(str_replace("-", "_", $name));
+            return $this->input->SERVER[$key] ?? null;
+        }
+
+        /**
+         * True when the request was sent by an <x-zubzet::island>, which expects the
+         * rendered view without its layout.
+         */
+        public function isIsland(): bool {
+            return $this->header("Z-Island") === "1";
+        }
+
+        /**
+         * The @fragment an island asked for, null when none or invalid.
+         */
+        public function islandFragment(): ?string {
+            $fragment = $this->header("Z-Island-Fragment");
+            if($fragment === null) return null;
+            if(!preg_match('/^[A-Za-z0-9_-]{1,64}$/', $fragment)) return null;
+            return $fragment;
+        }
+
         public function getRouteParameter($key = null) {
             if(isset($key)) {
                 return $this->urlParameters[$key] ?? null;
@@ -208,6 +236,7 @@
 
             if(!user()->isLoggedIn) {
                 if($boolResult) return false;
+                \ZubZet\Framework\Rendering\Island::refuse(401);
                 zubzet()->executePath(["login", "index"]);
                 exit;
             }
@@ -218,6 +247,7 @@
 
             if(!$hasPermission) {
                 if($boolResult) return false;
+                \ZubZet\Framework\Rendering\Island::refuse(403);
                 zubzet()->executePath(["error", "403"]);
                 exit;
             }
